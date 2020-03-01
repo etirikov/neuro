@@ -14,6 +14,7 @@ import seaborn as sns
 from multiprocessing.pool import Pool
 from scipy.signal import savgol_filter, medfilt
 import subprocess
+import redis
 
 def get_ROI(path, masker, delete_confounds):
     if delete_confounds:
@@ -45,8 +46,13 @@ def parallel_jobs_one_machine(config, person_path, person_number, masker, remove
     if config['ATLAS']['where_to_write']=='hdd':
         data.to_csv(save_path, index=False)
     else:
-        #TODO database
-        pass
+        redis_db = redis.Redis(host=config['DATABASE']['host'], port=config['DATABASE']['port'])
+        name = 'dataset_{}_people_{}_atlas_{}'.format(config['DATASET']['name'],
+                                                      person_number,
+                                                      config['ATLAS']['name'])
+        redis_db.sadd(name, data.to_json())
+        
+        
 
 
 def extract_ROI_one_machine(config_path):
@@ -63,9 +69,10 @@ def extract_ROI_one_machine(config_path):
     
     #atlas
     masker = get_masker(atlas_name)
-
+    print('start extract')
     if n_jobs <= 1:    
         for person in zip(people_path, people_number):
+            print(person)
             person_path = person[0]
             person_number = person[1]
             data = get_ROI(person_path, masker, remove_confounds)
@@ -89,3 +96,6 @@ def extract_ROI_one_machine(config_path):
 
 def extract_ROI_spark(config_path):
     pass
+
+if __name__ == '__main__':
+    extract_ROI_one_machine('config.ini')
