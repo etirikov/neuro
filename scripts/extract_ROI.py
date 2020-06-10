@@ -15,15 +15,17 @@ from nilearn import image
 from nilearn.connectome import ConnectivityMeasure
 from nilearn import datasets
 import nibabel
+import zipfile
 
 from scipy.signal import savgol_filter, medfilt
 
-from pyspark.sql.functions import col, pandas_udf, PandasUDFType
+from pyspark.sql.functions import pandas_udf, PandasUDFType
 from pyspark.sql.types import NullType
 from pyspark.sql import SparkSession
 from pyspark import SparkConf
+import happybase
 conf = SparkConf()
-# conf.setMaster('yarn-client')
+
 conf.setAppName('Test')
 conf.set("spark.hadoop.yarn.resourcemanager.hostname", '172.17.14.17')
 conf.set("spark.hadoop.yarn.resourcemanager.address", '172.17.14.17:8050')
@@ -51,81 +53,68 @@ def get_masker(atlas_name, atlas_path):
     masker.fit()
     return masker
 
+      
+def extract_archive_HCP(archive_path, path_to_save):
+    archive = zipfile.ZipFile(archive_path)
+    people_number = int(archive_path.split('/')[-1].split('_')[0])
+    rest_number = archive_path.split('/')[-1].split('_')[3]
+    path_in_archive = '{0}/MNINonLinear/Results/rfMRI_{1}_{2}/rfMRI_{1}_{2}.nii.gz'
+    pathes = []
+    for file in archive.namelist():
+        if file.startswith(path_in_archive.format(people_number, rest_number, 'LR')) or file.startswith(path_in_archive.format(people_number, rest_number, 'RL')):
+            archive.extract(file, path_to_save)
+            pathes.append(path_to_save+'/'+str(file))
+    return pathes
 
-def parallel_jobs_one_machine(config, person_path, person_number, masker, remove_confounds):
-    data = get_ROI(person_path, masker, remove_confounds)
-    columns = ['x' + str(i) for i in range(data.shape[1])]
-    data = pd.DataFrame(data, columns=columns)
-    save_path = config['ATLAS']['path_to_write'] + str(person_number)+'.csv'
-    if config['ATLAS']['where_to_write']=='hdd':
-        data.to_csv(save_path, index=False)
-    else:
-        pass
-        
-        
-def extract_ROI_one_machine(config_path):
-    config = configparser.ConfigParser()
-    config.read(config_path)
-    data_path = config['GENERAL']['data_path']
-    atlas_name = config['ATLAS']['atlas_name']
-    remove_confounds = bool(config['ATLAS']['remove_confounds'])
-    n_jobs = int(config['GENERAL']['n_jobs'])
-    
-    data = pd.read_csv(data_path)
-    people_path = data['path']
-    people_number = data['people_number']
-    
-    #atlas
-    masker = get_masker(atlas_name)
-    print('start extract')
-    if n_jobs <= 1:    
-        for person in zip(people_path, people_number):
-            print(person)
-            person_path = person[0]
-            person_number = person[1]
-            data = get_ROI(person_path, masker, remove_confounds)
-            columns = ['x' + str(i) for i in range(data.shape[1])]
-            data = pd.DataFrame(data, columns=columns)
-            save_path = config['ATLAS']['path_to_write'] + str(person_number)+'.csv'
-            if config['ATLAS']['where_to_write']=='hdd':
-                data.to_csv(save_path, index=False)
-            else:
-                #TODO database
-                pass
-    else:
-        params = list(zip([config]*data.shape[0],
-                          people_path, 
-                          people_number, 
-                          [masker]*data.shape[0], 
-                          [remove_confounds]*data.shape[0]))
 
-        with Pool(n_jobs) as pool:
-            pool.starmap(parallel_jobs_one_machine, params)
+def write_to_hbase(data, atlas, table_name, person, person_number):
+    connection = happybase.Connection()
+    table = connection.table(table_name)
+
+    data = data.to_json().encode('utf-8')
+    row = 'HCP_'+person
+    row = row.encode('utf-8')
+    table.put(row, {b'data:person': person_number.encode('utf-8'),
+                               b'data:dataset': b'HCP',
+                               b'data:atlas': atlas.encode('utf-8'),
+                               b'data:roi': data})
 
 
 @pandas_udf("path string, people_number long", PandasUDFType.GROUPED_MAP)
 def extract_ROI_spark(data):
-    print('111', data.shape)
     people_path = data['path']
     people_number = np.unique(data['people_number'])[0]
 
+    try:
+        os.mkdir('/tmp/nilearn_data')
+    except Exception as e:
+        a = 1
+
     atlas_path = '/data/test/nilearn_data'
-    
     masker = get_masker(atlas_name, atlas_path)
     j = 0
-    for person in zip(people_path, [people_number]*data.shape[1]):
-        person_path = person[0]
-        person_number = person[1]
-        print(person_path, person_number)
-        data_person = get_ROI(person_path, masker, remove_confounds)
-        columns = ['x' + str(i) for i in range(data_person.shape[1])]
-        data_person = pd.DataFrame(data_person, columns=columns)
-        save_path = config['ATLAS']['path_to_write'] + str(person_number)+'_{}_.csv'.format(j)
-        j+=1
-        if config['ATLAS']['where_to_write']=='hdd':
-            data_person.to_csv(save_path, index=False)
 
-    temp = pd.DataFrame([[j,people_number]], columns=['path', 'people_number'])
+    for person in zip(people_path, [people_number]*data.shape[1]):
+        pathes = extract_archive_HCP(person[0], '/tmp/nilearn_data')
+        j+=1
+
+        for person_path in pathes:
+            data_person = get_ROI(person_path, masker, True)
+            columns = ['x' + str(i) for i in range(data_person.shape[1])]
+
+            data_person = pd.DataFrame(data_person, columns=columns)
+            save_path = config['ATLAS']['path_to_write'] + str(people_number)+'_{}.csv'.format(j)
+            j+=1
+            if config['ATLAS']['where_to_write']=='hdd':
+                data_person.to_csv(save_path, index=False)
+            elif config['ATLAS']['where_to_write']=='base':
+                write_to_hbase(data_person, config['ATLAS']['name'], 
+                            config['DATABASE']['table_name'], str(person), str(person)+str(j))
+
+            
+            os.remove(person_path)
+    shutil.rmtree('/tmp/nilearn_data/'+str(people_number))
+    temp = pd.DataFrame([[pathes[0],people_number]], columns=['path', 'people_number'])
     return temp
 
 if __name__ == '__main__':
@@ -141,7 +130,10 @@ if __name__ == '__main__':
     masker = get_masker(atlas_name, None)
     
     data = pd.read_csv(data_path)
+    # data = data[:3]
+    print(data.shape)
     data_spark = spark.createDataFrame(data)
 
     df1 = data_spark.groupby("people_number").apply(extract_ROI_spark)
-    print(df1.select('path').toPandas())
+    print(df1.toPandas()['path'][0])
+
